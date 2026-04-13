@@ -1,0 +1,53 @@
+name: plamus
+description: >
+  Plamus — offline-first, professional Windows desktop music player with
+  library management, yt-dlp/ffmpeg ingestion, and premium minimalist UI.
+publish_to: "none"
+version: 1.0.0+1
+
+environment:
+  sdk: ">=3.5.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # Audio engine (desktop-friendly; continues when window is minimized).
+  # Windows/Linux: just_audio has no first-party Windows plugin — media_kit backend is required.
+  just_audio: ^0.9.42
+  just_audio_media_kit: ^2.1.0
+  media_kit_libs_windows_audio: any
+  audio_session: ^0.1.21
+
+  # Local SQLite on Windows via FFI.
+  sqflite_common_ffi: ^2.3.4
+  sqflite_common: ^2.5.4
+  path: ^1.9.0
+
+  # Paths and file picking.
+  path_provider: ^2.1.4
+  file_picker: ^8.1.4
+
+  # Icons.
+  font_awesome_flutter: ^10.7.0
+
+  # State management for player, library, and theme-driven rebuilds.
+  provider: ^6.1.2
+
+  # Drag-and-drop for the import modal (Windows desktop).
+  desktop_drop: ^0.4.4
+
+  cupertino_icons: ^1.0.8
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true
+
+  # Bundle Windows CLI tools; place yt-dlp.exe and ffmpeg.exe in assets/bin/
+  # before release builds (see assets/bin/README.txt).
+  assets:
+    - assets/bin/
