@@ -1,6 +1,6 @@
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
-import 'package:sqflite_common_ffi/sqflite_ffi.dart';
+import 'package:sqflite_common/sqflite.dart';
 
 import '../models/history_entry.dart';
 import '../models/playlist_model.dart';
@@ -8,10 +8,11 @@ import '../models/track_model.dart';
 
 /// SQLite access layer for Plamus (tracks, playlists, playlist_tracks, history).
 ///
-/// On desktop, initialize FFI in `main()` before opening the DB:
-/// `sqfliteFfiInit(); databaseFactory = databaseFactoryFfi;`
-/// This file imports `sqflite_common_ffi` so `databaseFactory` resolves to the
-/// same global assigned in `main.dart`.
+/// The global [databaseFactory] is configured in `main.dart`:
+///   * Windows / Linux / macOS — `sqflite_common_ffi` (`databaseFactoryFfi`).
+///   * Android / iOS — `sqflite` plugin (auto-registers natively).
+/// This file only imports the platform-neutral type surface from
+/// `sqflite_common`, so it compiles unchanged on every target.
 class DatabaseHelper {
   DatabaseHelper._();
 

@@ -1,5 +1,7 @@
 import 'dart:io';
 
+import 'package:ffmpeg_kit_flutter_new_audio/ffmpeg_kit.dart' as ffmpeg_kit;
+import 'package:ffmpeg_kit_flutter_new_audio/return_code.dart' as ffmpeg_rc;
 import 'package:path/path.dart' as p;
 
 import '../database/database_helper.dart';
@@ -10,7 +12,13 @@ import 'binary_service.dart';
 ///
 /// Audio files are copied (or optionally left in place — here we normalize
 /// into the app library directory). Video containers are passed through
-/// `ffmpeg` to extract an MP3 stream.
+/// `ffmpeg` to extract the audio track.
+///
+/// Cross-platform implementation:
+///   * **Windows / Linux / macOS** — spawns the bundled `ffmpeg.exe` resolved
+///     by [BinaryService] as a child process.
+///   * **Android** — calls into the in-process `ffmpeg_kit_flutter_new_audio`
+///     library instead. Same flags, same result, no executable to manage.
 class MediaIngestService {
   MediaIngestService._();
 
@@ -86,10 +94,37 @@ class MediaIngestService {
   }
 
   /// Runs ffmpeg to encode audio to high-quality MP3 (VBR q 0).
+  ///
+  /// Dispatches to the platform-appropriate backend (bundled exe on desktop,
+  /// in-process libffmpeg on Android).
   static Future<String> _extractAudioWithFfmpeg({
     required File videoFile,
     required Directory libraryDir,
     void Function(String message)? onLog,
+  }) async {
+    final base = p.basenameWithoutExtension(videoFile.path);
+    var outPath = p.join(libraryDir.path, '$base.mp3');
+    outPath = await _uniquePath(outPath);
+
+    if (Platform.isAndroid) {
+      return _extractAudioWithFfmpegKit(
+        videoFile: videoFile,
+        outPath: outPath,
+        onLog: onLog,
+      );
+    }
+    return _extractAudioWithFfmpegBinary(
+      videoFile: videoFile,
+      outPath: outPath,
+      onLog: onLog,
+    );
+  }
+
+  /// Desktop path: spawn the bundled ffmpeg.exe as a child process.
+  static Future<String> _extractAudioWithFfmpegBinary({
+    required File videoFile,
+    required String outPath,
+    required void Function(String message)? onLog,
   }) async {
     final res = BinaryService.instance.lastResolution;
     if (res == null || !res.ffmpegAvailable) {
@@ -98,10 +133,6 @@ class MediaIngestService {
         '${res?.errors.join(' ')}',
       );
     }
-
-    final base = p.basenameWithoutExtension(videoFile.path);
-    var outPath = p.join(libraryDir.path, '$base.mp3');
-    outPath = await _uniquePath(outPath);
 
     final args = <String>[
       '-y',
@@ -132,6 +163,41 @@ class MediaIngestService {
         args,
         'ffmpeg failed: ${err.isNotEmpty ? err : out}',
         result.exitCode,
+      );
+    }
+
+    final outFile = File(outPath);
+    if (!await outFile.exists()) {
+      throw StateError('ffmpeg reported success but output missing: $outPath');
+    }
+    return outPath;
+  }
+
+  /// Android path: call into ffmpeg_kit_flutter_new_audio's in-process FFmpeg.
+  static Future<String> _extractAudioWithFfmpegKit({
+    required File videoFile,
+    required String outPath,
+    required void Function(String message)? onLog,
+  }) async {
+    final args = <String>[
+      '-y',
+      '-i',
+      videoFile.path,
+      '-vn',
+      '-codec:a',
+      'libmp3lame',
+      '-q:a',
+      '0',
+      outPath,
+    ];
+    onLog?.call('ffmpeg ${args.join(' ')}');
+
+    final session = await ffmpeg_kit.FFmpegKit.executeWithArguments(args);
+    final code = await session.getReturnCode();
+    if (!ffmpeg_rc.ReturnCode.isSuccess(code)) {
+      final logs = await session.getAllLogsAsString();
+      throw StateError(
+        'ffmpeg failed (rc=${code?.getValue()}). ${logs ?? ''}',
       );
     }
 
