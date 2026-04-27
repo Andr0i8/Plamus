@@ -281,11 +281,12 @@ class YoutubeDownloadService {
     final builder = BytesBuilder(copy: false);
     await for (final chunk in resp.stream.timeout(timeout)) {
       builder.add(chunk);
-      // Only count progress for the actual chunk-aligned part of the response.
-      // When the CDN ignored the Range header (200), we drain the full body
-      // here but don't credit it to chunk progress — the caller handles that
-      // case separately by writing the whole body to disk.
-      if (!rangeIgnored) onChunkBytes(chunk.length);
+      // Always credit bytes-received to progress, both for the 206 chunk path
+      // and the 200 full-body fallback. The caller's progress callback
+      // divides by `totalBytes` so it works for either: streaming the whole
+      // body via 200 looks like a single big "chunk" advancing the bar to
+      // ~100%, which is the user-visible behaviour we want.
+      onChunkBytes(chunk.length);
     }
     return _RangeFetchResult(
       body: builder.takeBytes(),
