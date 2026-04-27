@@ -91,8 +91,6 @@ class YoutubeDownloadService {
           outFile: sink,
           chunks: clampedChunks,
           onProgress: onProgress,
-          ytFallback: yt,
-          fallbackInfo: audio,
         );
       } else {
         // Manifest didn't expose a size — fall back to a single sequential
@@ -124,21 +122,23 @@ class YoutubeDownloadService {
     }
   }
 
-  /// Splits [totalBytes] into [chunks] equal byte ranges, fetches them in
-  /// parallel via `Range:` headers, then writes them to [outFile] in order.
-  ///
-  /// If the first probe response is HTTP 200 (the CDN is not honouring the
-  /// range header), the function falls back to a single sequential stream so
-  /// the download still completes — using the youtube_explode_dart client so
-  /// throttled streams keep working.
+  /// Splits [totalBytes] into [chunks] equal byte ranges, then:
+  ///   1. Fetches chunk 0 alone as a probe.
+  ///      - If it returns HTTP 206, ranges are supported — fire the remaining
+  ///        chunks in parallel and reuse the probe's bytes as chunk 0.
+  ///      - If it returns HTTP 200 (range header ignored by the CDN), the
+  ///        server has streamed the full body to us already. We write that
+  ///        body straight to disk and skip the parallel path. This avoids the
+  ///        worst-case N×totalBytes bandwidth waste of letting all parallel
+  ///        requests each drain the full response.
+  ///   2. Reassembles the file with [RandomAccessFile.writeFrom] in chunk
+  ///      order.
   static Future<void> _downloadParallel({
     required Uri streamUri,
     required int totalBytes,
     required File outFile,
     required int chunks,
     required void Function(DownloadProgress p)? onProgress,
-    required YoutubeExplode ytFallback,
-    required AudioOnlyStreamInfo fallbackInfo,
   }) async {
     final ranges = <_ByteRange>[];
     final chunkSize = (totalBytes / chunks).ceil();
@@ -165,39 +165,68 @@ class YoutubeDownloadService {
     }
 
     final client = http.Client();
-    var rangeUnsupported = false;
+    Uint8List? fullBodyFromProbe;
     try {
-      await Future.wait(
-        ranges.map(
-          (r) async {
-            final fetched = await _fetchRange(
-              client: client,
-              streamUri: streamUri,
-              start: r.start,
-              end: r.end,
-              onChunkBytes: reportProgress,
-            );
-            if (fetched == null) {
-              rangeUnsupported = true;
-              return;
-            }
-            buffers[r.index] = fetched;
-          },
-        ),
-        eagerError: true,
+      // Probe with chunk 0 first. If the CDN ignores Range and returns 200,
+      // we capture the full body in one shot (the server sends it whether we
+      // asked for it or not) and skip the parallel path entirely — avoiding
+      // the worst-case N×totalBytes bandwidth waste of letting all parallel
+      // requests each drain the full response.
+      final probe = ranges.first;
+      final probeResult = await _fetchRange(
+        client: client,
+        streamUri: streamUri,
+        start: probe.start,
+        end: probe.end,
+        onChunkBytes: reportProgress,
       );
+      if (probeResult.rangeIgnored) {
+        fullBodyFromProbe = probeResult.body;
+        // Skip parallel — we already have the entire file from the probe.
+      } else {
+        buffers[probe.index] = probeResult.body;
+
+        // Probe confirmed 206 — fetch the remaining chunks in parallel.
+        if (ranges.length > 1) {
+          await Future.wait(
+            ranges.skip(1).map(
+                  (r) async {
+                    final res = await _fetchRange(
+                      client: client,
+                      streamUri: streamUri,
+                      start: r.start,
+                      end: r.end,
+                      onChunkBytes: reportProgress,
+                    );
+                    if (res.rangeIgnored) {
+                      // CDN flipped to 200 mid-flight on a follow-up chunk
+                      // (extremely unusual but treat it as a hard failure so
+                      // we don't end up with a partial file).
+                      throw const HttpException(
+                        'CDN stopped honouring Range header partway through '
+                        'a parallel download',
+                      );
+                    }
+                    buffers[r.index] = res.body;
+                  },
+                ),
+            eagerError: true,
+          );
+        }
+      }
     } finally {
       client.close();
     }
 
-    if (rangeUnsupported) {
-      await _downloadSingleStream(
-        yt: ytFallback,
-        info: fallbackInfo,
-        outFile: outFile,
-        totalBytes: totalBytes,
-        onProgress: onProgress,
-      );
+    // CDN ignored Range — write the probe's full body directly. No need to
+    // re-download via youtube_explode_dart.
+    if (fullBodyFromProbe != null) {
+      final raf = await outFile.open(mode: FileMode.write);
+      try {
+        await raf.writeFrom(fullBodyFromProbe);
+      } finally {
+        await raf.close();
+      }
       return;
     }
 
@@ -215,10 +244,16 @@ class YoutubeDownloadService {
     }
   }
 
-  /// Issues a single ranged GET. Returns the body bytes on HTTP 206; returns
-  /// `null` if the server responded with 200 (range ignored) so the caller can
-  /// fall back. Throws on other statuses.
-  static Future<Uint8List?> _fetchRange({
+  /// Issues a single ranged GET.
+  ///
+  /// On HTTP 206: returns the requested byte range with `rangeIgnored: false`.
+  ///
+  /// On HTTP 200 (CDN ignores Range): returns the **entire** response body
+  /// with `rangeIgnored: true`. Callers use this to skip the parallel path
+  /// without wasting another full download.
+  ///
+  /// Throws on any other status.
+  static Future<_RangeFetchResult> _fetchRange({
     required http.Client client,
     required Uri streamUri,
     required int start,
@@ -233,26 +268,29 @@ class YoutubeDownloadService {
         '(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36';
 
     final resp = await client.send(req).timeout(timeout);
-    if (resp.statusCode == 200) {
-      // Server ignored the range header — drain and signal fallback.
-      await resp.stream.drain<void>();
-      return null;
-    }
-    if (resp.statusCode != 206) {
+    if (resp.statusCode != 200 && resp.statusCode != 206) {
       // Drain so the underlying connection can be reused / closed cleanly.
-      await resp.stream.drain<void>().catchError((_) {});
+      await resp.stream.drain<void>().catchError((Object _) {});
       throw HttpException(
         'Range request failed (HTTP ${resp.statusCode}) for bytes=$start-$end',
         uri: streamUri,
       );
     }
 
+    final rangeIgnored = resp.statusCode == 200;
     final builder = BytesBuilder(copy: false);
     await for (final chunk in resp.stream.timeout(timeout)) {
       builder.add(chunk);
-      onChunkBytes(chunk.length);
+      // Only count progress for the actual chunk-aligned part of the response.
+      // When the CDN ignored the Range header (200), we drain the full body
+      // here but don't credit it to chunk progress — the caller handles that
+      // case separately by writing the whole body to disk.
+      if (!rangeIgnored) onChunkBytes(chunk.length);
     }
-    return builder.takeBytes();
+    return _RangeFetchResult(
+      body: builder.takeBytes(),
+      rangeIgnored: rangeIgnored,
+    );
   }
 
   /// Sequential fallback used when the manifest has no size, or the CDN does
@@ -333,4 +371,10 @@ class _ByteRange {
   final int index;
   final int start;
   final int end;
+}
+
+class _RangeFetchResult {
+  const _RangeFetchResult({required this.body, required this.rangeIgnored});
+  final Uint8List body;
+  final bool rangeIgnored;
 }
