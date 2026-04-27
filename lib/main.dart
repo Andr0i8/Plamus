@@ -22,8 +22,11 @@ import 'ui/shell/mobile_shell.dart';
 import 'ui/shell/plamus_shell.dart';
 import 'ui/theme/theme_controller.dart';
 
-/// Application entry: configures the per-platform audio + storage backends,
-/// extracts bundled binaries (desktop only), and mounts the shell.
+/// Application entry: only does *synchronous, Activity-independent* setup
+/// before [runApp]. Everything that touches a platform channel (the audio
+/// player, the background service, runtime permissions) is deferred to a
+/// post-frame callback inside [_PlamusBootstrap.initState] so the Android
+/// `FlutterFragmentActivity` is fully attached before we talk to it.
 ///
 /// Platform matrix:
 ///   * **Windows** — `just_audio` has no first-party Windows plugin, so the
@@ -31,8 +34,9 @@ import 'ui/theme/theme_controller.dart';
 ///     SQLite is provided by `sqflite_common_ffi`. After changing audio
 ///     dependencies, do a full cold restart (see CLAUDE.md).
 ///   * **Android** — `just_audio` uses its native plugin and
-///     [JustAudioBackground.init] wires the lock-screen / notification media
-///     session. SQLite is provided by the `sqflite` plugin (auto-registered).
+///     [JustAudioBackground.init] (called post-frame) wires the lock-screen /
+///     notification media session. SQLite is provided by the `sqflite` plugin
+///     (auto-registered).
 ///   * **Linux / macOS / iOS** — supported in principle by the same code paths
 ///     but not exercised in this repo.
 Future<void> main() async {
@@ -41,18 +45,6 @@ Future<void> main() async {
   if (Platform.isWindows) {
     JustAudioMediaKit.ensureInitialized(windows: true, linux: false);
     JustAudioMediaKit.title = 'Plamus';
-  }
-
-  if (Platform.isAndroid || Platform.isIOS) {
-    // Background playback service: the foreground service shows the persistent
-    // media notification and routes lock-screen / Bluetooth controls back to
-    // the just_audio player. Channel ids must be unique to this app.
-    await JustAudioBackground.init(
-      androidNotificationChannelId: 'com.example.plamus.audio',
-      androidNotificationChannelName: 'Plamus playback',
-      androidNotificationOngoing: true,
-      androidStopForegroundOnPause: true,
-    );
   }
 
   if (Platform.isWindows || Platform.isLinux || Platform.isMacOS) {
@@ -66,20 +58,102 @@ Future<void> main() async {
     sqflite_native.databaseFactory;
   }
 
+  // BinaryService is no-op on Android (returns an empty resolution); on
+  // desktop it just copies bundled exes into AppData and never touches the
+  // Flutter engine, so it's safe to await before runApp.
   await BinaryService.instance.ensureBinariesExtracted();
 
-  if (Platform.isAndroid) {
-    // Best-effort: the storage / notification permissions are also requested
-    // lazily from the Import flow when needed, but kicking the dialog here
-    // means first-launch users see the prompt before they even browse the UI.
-    unawaited(PermissionService.requestStartupPermissions());
+  runApp(const _PlamusBootstrap());
+}
+
+/// Two-phase bootstrap widget.
+///
+/// Phase 1 (synchronous build) — render a minimal scaffolded splash so the
+/// engine attaches to the Activity and the first frame renders.
+///
+/// Phase 2 (post-frame) — call [JustAudioBackground.init], request runtime
+/// permissions, and construct + initialise [AudioPlayerService]. Each of
+/// those can hit the Activity, so they must run *after* the first frame to
+/// avoid `IllegalStateException` on Android.
+class _PlamusBootstrap extends StatefulWidget {
+  const _PlamusBootstrap();
+
+  @override
+  State<_PlamusBootstrap> createState() => _PlamusBootstrapState();
+}
+
+class _PlamusBootstrapState extends State<_PlamusBootstrap> {
+  AudioPlayerService? _audio;
+  String? _bootError;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      unawaited(_bootstrap());
+    });
   }
 
-  final audio = AudioPlayerService();
-  await audio.init();
+  Future<void> _bootstrap() async {
+    try {
+      if (Platform.isAndroid || Platform.isIOS) {
+        // Background playback service: the foreground service shows the
+        // persistent media notification and routes lock-screen / Bluetooth
+        // controls back to the just_audio player. Channel ids must be unique
+        // to this app.
+        await JustAudioBackground.init(
+          androidNotificationChannelId: 'com.example.plamus.audio',
+          androidNotificationChannelName: 'Plamus playback',
+          androidNotificationOngoing: true,
+          androidStopForegroundOnPause: true,
+        );
+      }
 
-  runApp(
-    MultiProvider(
+      if (Platform.isAndroid) {
+        // Best-effort startup prompt; individual flows still re-request what
+        // they need lazily, so a denial here is non-fatal.
+        unawaited(PermissionService.requestStartupPermissions());
+      }
+
+      final audio = AudioPlayerService();
+      await audio.init();
+
+      if (!mounted) {
+        audio.dispose();
+        return;
+      }
+      setState(() => _audio = audio);
+    } catch (e, st) {
+      debugPrint('Plamus bootstrap failed: $e\n$st');
+      if (!mounted) return;
+      setState(() => _bootError = e.toString());
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final audio = _audio;
+    if (audio == null) {
+      return MaterialApp(
+        debugShowCheckedModeBanner: false,
+        theme: PlamusTheme.dark(),
+        home: Scaffold(
+          body: Center(
+            child: _bootError == null
+                ? const CircularProgressIndicator()
+                : Padding(
+                    padding: const EdgeInsets.all(24),
+                    child: Text(
+                      'Plamus failed to start: $_bootError',
+                      textAlign: TextAlign.center,
+                    ),
+                  ),
+          ),
+        ),
+      );
+    }
+
+    return MultiProvider(
       providers: [
         ChangeNotifierProvider(
           create: (_) => LibraryService(DatabaseHelper.instance),
@@ -88,8 +162,8 @@ Future<void> main() async {
         ChangeNotifierProvider(create: (_) => ThemeController()),
       ],
       child: const PlamusApp(),
-    ),
-  );
+    );
+  }
 }
 
 /// Root [MaterialApp] wired to [ThemeController] and Plamus themes.
