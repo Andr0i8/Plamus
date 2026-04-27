@@ -1,6 +1,8 @@
 import 'dart:async';
 import 'dart:io';
+import 'dart:typed_data';
 
+import 'package:http/http.dart' as http;
 import 'package:path/path.dart' as p;
 import 'package:youtube_explode_dart/youtube_explode_dart.dart';
 
@@ -10,19 +12,26 @@ import 'download_service.dart';
 /// `yt-dlp`).
 ///
 /// Resolves a video URL/ID to its highest-bitrate audio-only stream via
-/// `youtube_explode_dart`, then streams the bytes to disk while reporting
-/// progress in the same shape as [DownloadProgress] so [import_panel.dart]
-/// can stay agnostic of the platform.
+/// `youtube_explode_dart`, then fetches the audio bytes with **parallel HTTP
+/// range requests** — the same trick `yt-dlp --concurrent-fragments` uses to
+/// saturate a fast mobile connection. The on-disk file is assembled by writing
+/// each chunk in order once all fetches complete.
 ///
-/// We keep the original audio container (`.m4a` or `.webm`) — `just_audio`
-/// plays both natively on Android, so transcoding to MP3 would only add CPU
-/// cost and battery drain without quality benefit. If the user wants MP3
-/// specifically, a future ffmpeg pass can be added.
+/// Progress events are reported in the shape of [DownloadProgress] so
+/// `import_panel.dart` stays platform-agnostic. We keep the original audio
+/// container (`.m4a` or `.webm`) — `just_audio` plays both natively on Android,
+/// so transcoding to MP3 would only add CPU cost and battery drain without
+/// quality benefit.
 class YoutubeDownloadService {
   YoutubeDownloadService._();
 
   /// Hard cap so a stalled stream cannot leave the UI on "Starting…" forever.
   static const Duration timeout = Duration(minutes: 30);
+
+  /// Default number of parallel HTTP range requests. 8 is a sweet spot for
+  /// modern mobile networks: enough parallelism to saturate the link without
+  /// triggering YouTube's per-IP connection caps.
+  static const int defaultParallelChunks = 8;
 
   /// Downloads the audio track of [url] into [outputDirectory] and returns the
   /// path of the saved file.
@@ -34,11 +43,13 @@ class YoutubeDownloadService {
     required String url,
     required String outputDirectory,
     void Function(DownloadProgress p)? onProgress,
+    int parallelChunks = defaultParallelChunks,
   }) async {
     final trimmed = url.trim();
     if (trimmed.isEmpty) {
       throw ArgumentError.value(url, 'url', 'URL must not be empty');
     }
+    final clampedChunks = parallelChunks.clamp(1, 16);
 
     final outDir = Directory(outputDirectory);
     if (!await outDir.exists()) {
@@ -63,6 +74,7 @@ class YoutubeDownloadService {
       final outPath = await _uniquePath(
         p.join(outputDirectory, '$safeTitle.$ext'),
       );
+      sink = File(outPath);
 
       onProgress?.call(
         DownloadProgress(
@@ -71,46 +83,27 @@ class YoutubeDownloadService {
         ),
       );
 
-      sink = File(outPath);
-      final ioSink = sink.openWrite();
       final total = audio.size.totalBytes;
-      var received = 0;
-
-      try {
-        final stream = yt.videos.streamsClient.get(audio);
-        final completer = Completer<void>();
-        StreamSubscription<List<int>>? sub;
-        sub = stream.listen(
-          (chunk) {
-            received += chunk.length;
-            ioSink.add(chunk);
-            if (total > 0 && onProgress != null) {
-              final frac = (received / total).clamp(0.0, 1.0);
-              onProgress(
-                DownloadProgress(
-                  fraction: frac,
-                  message: '${(frac * 100).toStringAsFixed(1)}%',
-                ),
-              );
-            }
-          },
-          onError: (Object e, StackTrace st) {
-            if (!completer.isCompleted) completer.completeError(e, st);
-          },
-          onDone: () {
-            if (!completer.isCompleted) completer.complete();
-          },
-          cancelOnError: true,
+      if (total > 0) {
+        await _downloadParallel(
+          streamUri: audio.url,
+          totalBytes: total,
+          outFile: sink,
+          chunks: clampedChunks,
+          onProgress: onProgress,
+          ytFallback: yt,
+          fallbackInfo: audio,
         );
-
-        try {
-          await completer.future.timeout(timeout);
-        } finally {
-          await sub.cancel();
-        }
-      } finally {
-        await ioSink.flush();
-        await ioSink.close();
+      } else {
+        // Manifest didn't expose a size — fall back to a single sequential
+        // stream so the download still works.
+        await _downloadSingleStream(
+          yt: yt,
+          info: audio,
+          outFile: sink,
+          totalBytes: total,
+          onProgress: onProgress,
+        );
       }
 
       onProgress?.call(
@@ -128,6 +121,186 @@ class YoutubeDownloadService {
       rethrow;
     } finally {
       yt.close();
+    }
+  }
+
+  /// Splits [totalBytes] into [chunks] equal byte ranges, fetches them in
+  /// parallel via `Range:` headers, then writes them to [outFile] in order.
+  ///
+  /// If the first probe response is HTTP 200 (the CDN is not honouring the
+  /// range header), the function falls back to a single sequential stream so
+  /// the download still completes — using the youtube_explode_dart client so
+  /// throttled streams keep working.
+  static Future<void> _downloadParallel({
+    required Uri streamUri,
+    required int totalBytes,
+    required File outFile,
+    required int chunks,
+    required void Function(DownloadProgress p)? onProgress,
+    required YoutubeExplode ytFallback,
+    required AudioOnlyStreamInfo fallbackInfo,
+  }) async {
+    final ranges = <_ByteRange>[];
+    final chunkSize = (totalBytes / chunks).ceil();
+    for (var i = 0; i < chunks; i++) {
+      final start = i * chunkSize;
+      if (start >= totalBytes) break;
+      final end = ((i + 1) * chunkSize - 1).clamp(0, totalBytes - 1);
+      ranges.add(_ByteRange(i, start, end));
+    }
+
+    final buffers = List<Uint8List?>.filled(ranges.length, null);
+    var totalReceived = 0;
+
+    void reportProgress(int delta) {
+      totalReceived += delta;
+      if (onProgress == null) return;
+      final frac = (totalReceived / totalBytes).clamp(0.0, 1.0);
+      onProgress(
+        DownloadProgress(
+          fraction: frac,
+          message: '${(frac * 100).toStringAsFixed(1)}%',
+        ),
+      );
+    }
+
+    final client = http.Client();
+    var rangeUnsupported = false;
+    try {
+      await Future.wait(
+        ranges.map(
+          (r) async {
+            final fetched = await _fetchRange(
+              client: client,
+              streamUri: streamUri,
+              start: r.start,
+              end: r.end,
+              onChunkBytes: reportProgress,
+            );
+            if (fetched == null) {
+              rangeUnsupported = true;
+              return;
+            }
+            buffers[r.index] = fetched;
+          },
+        ),
+        eagerError: true,
+      );
+    } finally {
+      client.close();
+    }
+
+    if (rangeUnsupported) {
+      await _downloadSingleStream(
+        yt: ytFallback,
+        info: fallbackInfo,
+        outFile: outFile,
+        totalBytes: totalBytes,
+        onProgress: onProgress,
+      );
+      return;
+    }
+
+    // Assemble the file by writing each chunk at its natural position.
+    final raf = await outFile.open(mode: FileMode.write);
+    try {
+      for (final buf in buffers) {
+        if (buf == null) {
+          throw StateError('Internal error: chunk buffer missing');
+        }
+        await raf.writeFrom(buf);
+      }
+    } finally {
+      await raf.close();
+    }
+  }
+
+  /// Issues a single ranged GET. Returns the body bytes on HTTP 206; returns
+  /// `null` if the server responded with 200 (range ignored) so the caller can
+  /// fall back. Throws on other statuses.
+  static Future<Uint8List?> _fetchRange({
+    required http.Client client,
+    required Uri streamUri,
+    required int start,
+    required int end,
+    required void Function(int n) onChunkBytes,
+  }) async {
+    final req = http.Request('GET', streamUri);
+    req.headers['Range'] = 'bytes=$start-$end';
+    // YouTube's CDN occasionally rejects requests without a UA.
+    req.headers['User-Agent'] =
+        'Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 '
+        '(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36';
+
+    final resp = await client.send(req).timeout(timeout);
+    if (resp.statusCode == 200) {
+      // Server ignored the range header — drain and signal fallback.
+      await resp.stream.drain<void>();
+      return null;
+    }
+    if (resp.statusCode != 206) {
+      // Drain so the underlying connection can be reused / closed cleanly.
+      await resp.stream.drain<void>().catchError((_) {});
+      throw HttpException(
+        'Range request failed (HTTP ${resp.statusCode}) for bytes=$start-$end',
+        uri: streamUri,
+      );
+    }
+
+    final builder = BytesBuilder(copy: false);
+    await for (final chunk in resp.stream.timeout(timeout)) {
+      builder.add(chunk);
+      onChunkBytes(chunk.length);
+    }
+    return builder.takeBytes();
+  }
+
+  /// Sequential fallback used when the manifest has no size, or the CDN does
+  /// not honour range requests. Uses youtube_explode_dart's stream client so
+  /// throttled streams continue to work.
+  static Future<void> _downloadSingleStream({
+    required YoutubeExplode yt,
+    required AudioOnlyStreamInfo info,
+    required File outFile,
+    required int totalBytes,
+    required void Function(DownloadProgress p)? onProgress,
+  }) async {
+    final ioSink = outFile.openWrite();
+    var received = 0;
+    try {
+      final stream = yt.videos.streamsClient.get(info);
+      final completer = Completer<void>();
+      StreamSubscription<List<int>>? sub;
+      sub = stream.listen(
+        (chunk) {
+          received += chunk.length;
+          ioSink.add(chunk);
+          if (totalBytes > 0 && onProgress != null) {
+            final frac = (received / totalBytes).clamp(0.0, 1.0);
+            onProgress(
+              DownloadProgress(
+                fraction: frac,
+                message: '${(frac * 100).toStringAsFixed(1)}%',
+              ),
+            );
+          }
+        },
+        onError: (Object e, StackTrace st) {
+          if (!completer.isCompleted) completer.completeError(e, st);
+        },
+        onDone: () {
+          if (!completer.isCompleted) completer.complete();
+        },
+        cancelOnError: true,
+      );
+      try {
+        await completer.future.timeout(timeout);
+      } finally {
+        await sub.cancel();
+      }
+    } finally {
+      await ioSink.flush();
+      await ioSink.close();
     }
   }
 
@@ -153,4 +326,11 @@ class YoutubeDownloadService {
     }
     throw StateError('Could not allocate unique path near $path');
   }
+}
+
+class _ByteRange {
+  const _ByteRange(this.index, this.start, this.end);
+  final int index;
+  final int start;
+  final int end;
 }
