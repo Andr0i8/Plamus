@@ -88,6 +88,22 @@ class GlassPlayerBar extends StatelessWidget {
                       mainAxisSize: MainAxisSize.min,
                       mainAxisAlignment: MainAxisAlignment.center,
                       children: [
+                        IconButton(
+                          visualDensity: VisualDensity.compact,
+                          constraints: const BoxConstraints(minWidth: 36, minHeight: 36),
+                          tooltip: audio.shuffleEnabled
+                              ? 'Shuffle: on'
+                              : 'Shuffle: off',
+                          onPressed: () => audio.toggleShuffle(),
+                          icon: FaIcon(
+                            FontAwesomeIcons.shuffle,
+                            size: 18,
+                            color: audio.shuffleEnabled
+                                ? primary
+                                : (theme.iconTheme.color ?? Colors.white)
+                                    .withValues(alpha: 0.7),
+                          ),
+                        ),
                         BouncyIconButton(
                           tooltip: 'Previous',
                           icon: FontAwesomeIcons.backwardStep,

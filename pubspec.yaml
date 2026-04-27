@@ -1,7 +1,8 @@
 name: plamus
 description: >
-  Plamus — offline-first, professional Windows desktop music player with
-  library management, yt-dlp/ffmpeg ingestion, and premium minimalist UI.
+  Plamus — offline-first, professional music player with library
+  management, YouTube/yt-dlp/ffmpeg ingestion, and a premium minimalist UI.
+  Targets Windows desktop and Android mobile from a single codebase.
 publish_to: "none"
 version: 1.0.0+1
 
@@ -12,19 +13,34 @@ dependencies:
   flutter:
     sdk: flutter
 
-  # Audio engine (desktop-friendly; continues when window is minimized).
-  # Windows/Linux: just_audio has no first-party Windows plugin — media_kit backend is required.
+  # Audio engine.
+  # - Android/iOS: just_audio uses its native first-party plugin.
+  # - Windows/Linux: just_audio has no native plugin, so we register the
+  #   media_kit backend at runtime via JustAudioMediaKit.ensureInitialized().
+  # The just_audio_media_kit and media_kit_libs_windows_audio packages only
+  # contribute on desktop; they don't affect the Android plugin path.
   just_audio: ^0.9.42
   just_audio_media_kit: ^2.1.0
   media_kit_libs_windows_audio: any
   audio_session: ^0.1.21
 
-  # Local SQLite on Windows via FFI.
+  # Background playback + lock screen / notification media controls (Android).
+  # No-op on Windows because we never call configure() there.
+  just_audio_background: ^0.0.1-beta.13
+  # `MediaItem` type for the AudioSource tag — declared explicitly so we don't
+  # rely on a transitive export of just_audio_background.
+  audio_service: ^0.18.15
+
+  # Local SQLite.
+  # - Android/iOS: sqflite plugin (native).
+  # - Windows/Linux/macOS: sqflite_common_ffi using bundled SQLite.
+  # Both contribute a databaseFactory; main.dart wires the right one.
+  sqflite: ^2.3.0
   sqflite_common_ffi: ^2.3.4
   sqflite_common: ^2.5.4
   path: ^1.9.0
 
-  # Paths and file picking.
+  # Paths and file picking (cross-platform).
   path_provider: ^2.1.4
   file_picker: ^8.1.4
 
@@ -34,8 +50,22 @@ dependencies:
   # State management for player, library, and theme-driven rebuilds.
   provider: ^6.1.2
 
-  # Drag-and-drop for the import modal (Windows desktop).
+  # Drag-and-drop for the desktop import modal.
+  # The package is desktop-only natively; on Android we never instantiate
+  # DropTarget so no platform channel calls happen.
   desktop_drop: ^0.4.4
+
+  # Android-only platform features (safe to include in pubspec on all
+  # platforms because we guard usage with Platform.isAndroid checks).
+  #
+  # YouTube extraction (pure Dart, works on every platform).
+  youtube_explode_dart: ^2.2.0
+  # HTTP download client used to fetch YouTube audio streams on Android.
+  http: ^1.2.0
+  # Audio-only ffmpeg build for Android transcoding (video -> audio).
+  ffmpeg_kit_flutter_new_audio: ^2.0.0
+  # Runtime permissions (READ_MEDIA_AUDIO, notifications, storage).
+  permission_handler: ^11.3.0
 
   cupertino_icons: ^1.0.8
 

@@ -60,6 +60,18 @@ class BinaryService {
   /// Safe to call on every launch: skips rewrite when the on-disk file already
   /// matches the embedded asset byte length.
   Future<BinaryResolution> ensureBinariesExtracted() async {
+    // Android (and iOS) ship FFmpeg in-process via `ffmpeg_kit_flutter_new_audio`
+    // and download via `youtube_explode_dart` — no external `.exe` binaries
+    // are needed or even runnable, so we record an empty resolution and exit.
+    if (Platform.isAndroid || Platform.isIOS) {
+      _cached = const BinaryResolution(
+        ytDlpPath: '',
+        ffmpegPath: '',
+        ytDlpAvailable: false,
+        ffmpegAvailable: false,
+      );
+      return _cached!;
+    }
     final errors = <String>[];
     try {
       final support = await getApplicationSupportDirectory();
